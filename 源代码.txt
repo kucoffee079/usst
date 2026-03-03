@@ -1,0 +1,325 @@
+#include <opencv2/opencv.hpp>
+#include <vector>
+#include <iostream>
+#include <algorithm>
+#include <cmath>
+
+using namespace cv;
+using namespace std;
+
+// ==========================================
+// 1. 全局参数配置
+// ==========================================
+Point g_nozzlePos(172, 35); // 喷嘴坐标
+const string VIDEO_PATH = "D:/final_visual/video/sp.mp4";
+
+// 依然保留这个区域定义，用于限制计算范围
+const Rect ROI_RECT(350, 100, 450, 300);
+
+// 平滑与记忆参数
+double g_avg_A = 0, g_avg_B = 0;
+bool g_isFirstFit = true;
+int g_lost_frames = 0;
+const int MAX_LOST_FRAMES = 15;
+
+// 火焰位置记忆
+Rect g_lastFireRect;
+bool g_hasLastFire = false;
+
+// 鼠标回调
+void onMouse(int event, int x, int y, int flags, void* userdata) {
+    if (event == EVENT_LBUTTONDOWN) {
+        g_nozzlePos = Point(x, y);
+        g_isFirstFit = true;
+        cout << "【喷嘴更新】 " << g_nozzlePos << endl;
+    }
+}
+
+// ==========================================
+// 2. 核心数学算法：强力约束拟合
+// ==========================================
+bool fitParabolaConstrained(const vector<Point>& points, Point origin,
+    Rect fireRect, bool useStrongLock, 
+    double& A, double& B) {
+
+    // 门槛稍微提高一点，只有5个点太少了，容易被噪点干扰
+    if (points.size() < 10) return false;
+
+    double sum_X2 = 0, sum_X3 = 0, sum_X4 = 0;
+    double sum_XY = 0, sum_X2Y = 0;
+
+    // --- 阶段1：真实水流数据 ---
+    for (const auto& p : points) {
+        double X = p.x - origin.x;
+        double Y = p.y - origin.y;
+
+        if (X < 5) continue;
+
+        double weight = 2.0;
+        if (X < 150) weight = 50.0; // 保头
+
+        // 这里的 useStrongLock 仅仅代表“我们要不要把目标点加入计算”
+        // 如果有火，但是水流还没到，我们可能传入 false，不让它去尾
+        if (useStrongLock && p.x > fireRect.x) weight = 0.01;
+
+        double X2 = X * X;
+        sum_X2 += X2 * weight;
+        sum_X3 += X2 * X * weight;
+        sum_X4 += X2 * X2 * weight;
+        sum_XY += X * Y * weight;
+        sum_X2Y += X2 * Y * weight;
+    }
+
+    // --- 阶段2：目标绑定 (绝对锁定) ---
+    // 只有当 useStrongLock 为真时，才强制拉向火焰
+    if (useStrongLock) {
+        double targetX = (fireRect.x + fireRect.width / 2) - origin.x;
+        double targetY = (fireRect.y + fireRect.height) - origin.y;
+
+        double weight = 100;
+
+        double X2 = targetX * targetX;
+        sum_X2 += X2 * weight;
+        sum_X3 += X2 * targetX * weight;
+        sum_X4 += X2 * X2 * weight;
+        sum_XY += targetX * targetY * weight;
+        sum_X2Y += X2 * targetY * weight;
+    }
+
+    Mat M = (Mat_<double>(2, 2) << sum_X4, sum_X3, sum_X3, sum_X2);
+    Mat K = (Mat_<double>(2, 1) << sum_X2Y, sum_XY);
+    Mat Res;
+
+    if (solve(M, K, Res)) {
+        A = Res.at<double>(0, 0);
+        B = Res.at<double>(1, 0);
+        return true;
+    }
+    return false;
+}
+
+// ==========================================
+// 3. 主程序
+// ==========================================
+int main() {
+    VideoCapture cap(VIDEO_PATH);
+    if (!cap.isOpened()) {
+        cerr << "错误：无法打开视频" << endl;
+        return -1;
+    }
+
+    namedWindow("Result");
+    setMouseCallback("Result", onMouse, 0);
+
+    Mat frame, gray, baseBackground, diff, maskWater, maskClean;
+    Mat hsvROI, maskFlameROI;
+
+    Mat kernelFire = getStructuringElement(MORPH_RECT, Size(11, 11));
+    Mat kernelConnect = getStructuringElement(MORPH_RECT, Size(15, 3));
+
+    bool hasBackground = false;
+
+    while (true) {
+        cap >> frame;
+        if (frame.empty()) {
+            cap.set(CAP_PROP_POS_FRAMES, 0);
+            continue;
+        }
+
+        cvtColor(frame, gray, COLOR_BGR2GRAY);
+        if (!hasBackground) {
+            gray.copyTo(baseBackground);
+            hasBackground = true;
+            if (cap.get(CAP_PROP_POS_FRAMES) < 5) continue;
+        }
+
+        // =========================================================
+        // 模块 A: 火焰检测
+        // =========================================================
+        Rect frameRect(0, 0, frame.cols, frame.rows);
+        Rect safeROI = ROI_RECT & frameRect;
+        bool fireFound = false;
+
+        if (!safeROI.empty()) {
+            Mat frameROI = frame(safeROI);
+            Mat hsvROI;
+            cvtColor(frameROI, hsvROI, COLOR_BGR2HSV);
+
+            Mat mask1, mask2;
+            inRange(hsvROI, Scalar(0, 110, 155), Scalar(10, 255, 255), mask1);
+            inRange(hsvROI, Scalar(170, 110, 155), Scalar(180, 255, 255), mask2);
+            maskFlameROI = mask1 | mask2;
+
+            morphologyEx(maskFlameROI, maskFlameROI, MORPH_CLOSE, kernelFire);
+            morphologyEx(maskFlameROI, maskFlameROI, MORPH_DILATE, kernelFire);
+
+            vector<vector<Point>> contours;
+            findContours(maskFlameROI, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+            if (!contours.empty()) {
+                sort(contours.begin(), contours.end(), [](const vector<Point>& a, const vector<Point>& b) {
+                    return contourArea(a) > contourArea(b);
+                    });
+
+                if (contourArea(contours[0]) > 50) {
+                    Rect localRect = boundingRect(contours[0]);
+                    g_lastFireRect = localRect;
+                    g_lastFireRect.x += safeROI.x;
+                    g_lastFireRect.y += safeROI.y;
+                    fireFound = true;
+                    g_hasLastFire = true;
+
+                    // 画出红色的火框
+                    rectangle(frame, g_lastFireRect, Scalar(0, 0, 255), 2);
+                    putText(frame, "Fire", Point(g_lastFireRect.x, g_lastFireRect.y - 5),
+                        FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 255), 2);
+                }
+            }
+        }
+
+
+        // =========================================================
+        // 模块 B: 水柱检测
+        // =========================================================
+        absdiff(gray, baseBackground, diff);
+        threshold(diff, maskWater, 20, 255, THRESH_BINARY);
+        rectangle(maskWater, Point(0, 0), Point(frame.cols, 25), Scalar(0), -1);
+
+        if (g_hasLastFire) {
+            Rect blockRect = g_lastFireRect;
+            blockRect.x -= 10; blockRect.y -= 10;
+            blockRect.width += 20; blockRect.height += 20;
+            rectangle(maskWater, blockRect, Scalar(0), -1);
+        }
+
+        morphologyEx(maskWater, maskWater, MORPH_OPEN, Mat());
+        morphologyEx(maskWater, maskWater, MORPH_DILATE, kernelConnect);
+
+        maskClean = Mat::zeros(maskWater.size(), CV_8UC1);
+        vector<vector<Point>> waterContours;
+        findContours(maskWater, waterContours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+        for (const auto& cnt : waterContours) {
+            if (contourArea(cnt) < 100) continue;
+            if (pointPolygonTest(cnt, g_nozzlePos, true) > -50) {
+                drawContours(maskClean, vector<vector<Point>>{cnt}, -1, Scalar(255), -1);
+            }
+        }
+
+        vector<Point> waterPoints;
+        int maxWaterX = g_nozzlePos.x; //记录水流最远到了哪里
+
+        for (int x = g_nozzlePos.x; x < maskClean.cols; x += 5) {
+            int sumY = 0; int count = 0;
+            for (int y = g_nozzlePos.y; y < maskClean.rows; y++) {
+                if (maskClean.at<uchar>(y, x) > 0) {
+                    sumY += y; count++;
+                }
+            }
+            if (count > 0) {
+                Point pt(x, sumY / count);
+                waterPoints.push_back(pt);
+                if (pt.x > maxWaterX) maxWaterX = pt.x; // 更新最远X
+            }
+        }
+
+        // =========================================================
+        // 模块 C: 拟合与绘制
+        // =========================================================
+        double curr_A, curr_B;
+        bool success = false;
+
+        // 判断是否应该“锁定”火焰
+        bool shouldLockToFire = false;
+        if (g_hasLastFire) {
+            double distanceToFire = g_lastFireRect.x - g_nozzlePos.x;
+            double waterTravelDist = maxWaterX - g_nozzlePos.x;
+
+            // 只有当水流已经飞过了全程的40% 时，才启动强力锁定
+            // 这样水刚出来时，不会瞬间连线到火上
+            if (distanceToFire > 0 && (waterTravelDist / distanceToFire) > 0.4) {
+                shouldLockToFire = true;
+            }
+        }
+
+        // 只有当水流点数足够，或者已经进入锁定模式且有记忆时，才进行拟合
+        if (waterPoints.size() > 10 || (shouldLockToFire && waterPoints.size() > 0)) {
+            // 将 shouldLockToFire 传入拟合函数
+            if (fitParabolaConstrained(waterPoints, g_nozzlePos, g_lastFireRect, shouldLockToFire, curr_A, curr_B)) {
+                // 如果没有锁定火焰，我们对拟合结果的检查要更严格一点，防止画出乱飞的线
+                if (curr_A > -0.005 && curr_A < 0.005) success = true;
+            }
+        }
+
+        if (success) {
+            g_lost_frames = 0;
+            if (g_isFirstFit) {
+                g_avg_A = curr_A; g_avg_B = curr_B;
+                g_isFirstFit = false;
+            }
+            else {
+                double diffA = abs(curr_A - g_avg_A);
+                double alpha = (diffA > 0.00005) ? 0.6 : 0.2;
+                g_avg_A = g_avg_A * (1.0 - alpha) + curr_A * alpha;
+                g_avg_B = g_avg_B * (1.0 - alpha) + curr_B * alpha;
+            }
+        }
+        else {
+            g_lost_frames++;
+        }
+
+        // 绘制逻辑
+        if (!g_isFirstFit && g_lost_frames < MAX_LOST_FRAMES) {
+            vector<Point> curvePoints;
+            int drawEndX = frame.cols;
+
+            if (g_hasLastFire) {
+                drawEndX = g_lastFireRect.x + g_lastFireRect.width / 2;
+            }
+
+            // 如果还没锁定火焰，只画到水流实际到达的地方稍微远一点
+            // 避免线画得比水还快太多
+            if (!shouldLockToFire) {
+                drawEndX = maxWaterX + 100; // 只比当前水流多画100像素
+                if (drawEndX > frame.cols) drawEndX = frame.cols;
+            }
+
+            for (int x = g_nozzlePos.x; x <= drawEndX; x += 5) {
+                double X = x - g_nozzlePos.x;
+                double Y = g_avg_A * X * X + g_avg_B * X + g_nozzlePos.y;
+
+                if (g_hasLastFire && shouldLockToFire && Y > g_lastFireRect.y + g_lastFireRect.height) {
+                    curvePoints.push_back(Point(x, (int)Y));
+                    break;
+                }
+
+                if (Y >= 0 && Y < frame.rows) {
+                    curvePoints.push_back(Point(x, (int)Y));
+                }
+            }
+
+            // 线太短就不画了，避免噪点闪烁
+            if (curvePoints.size() > 5) {
+                polylines(frame, curvePoints, false, Scalar(0, 165, 255), 3, LINE_AA);
+            }
+
+            if (fireFound || g_hasLastFire) {
+                // 只有真的喷水了才显示文字
+                if (waterPoints.size() > 20) {
+                    string statusText = "Water spray working";
+                    putText(frame, statusText, Point(g_nozzlePos.x + 20, g_nozzlePos.y + 40),
+                        FONT_HERSHEY_SIMPLEX, 0.8, Scalar(255, 0, 255), 2);
+                }
+            }
+        }
+
+        circle(frame, g_nozzlePos, 6, Scalar(255, 0, 0), -1);
+        imshow("Result", frame);
+
+        if (waitKey(30) == 27) break;
+    }
+
+    cap.release();
+    destroyAllWindows();
+    return 0;
+}
